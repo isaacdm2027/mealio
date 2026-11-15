@@ -8,6 +8,16 @@ from datetime import datetime
 
 import streamlit as st
 
+# On Streamlit Cloud, copy the keys from the Secrets box into the settings our code reads.
+# This must happen BEFORE importing engine, because kroger.py and usda.py read the keys when imported.
+KEY_NAMES = ["KROGER_CLIENT_ID", "KROGER_CLIENT_SECRET", "USDA_API_KEY", "ANTHROPIC_API_KEY"]
+try:
+    for key in KEY_NAMES:
+        if key in st.secrets:
+            os.environ[key] = str(st.secrets[key]).strip()
+except Exception:
+    pass  # no Secrets box (running on a laptop), so the .env file is used instead
+
 from engine import build_plan, CALORIE_FLOOR
 
 STORES = {
@@ -78,6 +88,10 @@ with st.sidebar:
         "Meal.io gives grocery suggestions, not medical advice. For personal nutrition help, "
         "the UGA Health Center offers free nutrition support."
     )
+    # TEMPORARY key check: shows whether each key loaded and its length, never the key itself
+    for key in KEY_NAMES:
+        value = os.getenv(key)
+        st.caption(f"{key}: {f'loaded, {len(value)} characters' if value else 'MISSING'}")
 
 profile = {
     "budget": budget,
