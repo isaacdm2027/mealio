@@ -124,6 +124,8 @@ elif result["passed"]:
     st.success("This plan passed every check: within budget, meets your goals, and everything is priced.")
 else:
     st.warning("We couldn't find a plan that passes every check. Here is the closest one:")
+    if result.get("budget_note"):
+        st.info(result["budget_note"])
     for problem in result["problems"]:
         st.write(f"- {problem}")
 

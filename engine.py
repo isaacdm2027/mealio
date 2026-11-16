@@ -10,7 +10,9 @@ How it works:
      and every meal ingredient on the grocery list. If a check fails, Claude revises
      the plan with the real prices in hand, and we check again (up to 4 tries).
      Calories must be within 10% of the student's target, and never below the safety floor.
-  6. Variety: no meal should repeat more than twice a week. This is a "soft" check: if a plan
+  6. Portions: if a plan misses the calorie target, our code scales the portions up or down to hit it
+     (calories scale in a straight line), and Claude re-picks package counts for the new amounts.
+  7. Variety: no meal should repeat more than 3 times a week. This is a "soft" check: if a plan
      passes everything else but repeats meals, Claude gets one chance to add variety. If that
      would break the budget (or another check), we keep the earlier plan and its repeats.
 
@@ -30,9 +32,50 @@ MAX_TRIES = 4
 MAX_ITEMS = 15
 CALORIE_FLOOR = 1200  # safety guardrail: no plan or target can go below this many calories a day
 CALORIE_TOLERANCE = 0.10  # a plan passes if it is within 10% of the student's calorie target
-MAX_REPEATS = 2  # the same meal should appear at most this many times a week (leftovers count)
+MAX_REPEATS = 3  # the same meal should appear at most this many times a week (leftovers count)
 VARIETY_RETRIES = 1  # extra attempts allowed just to improve variety
-PANTRY_STAPLES = {"salt", "pepper", "black pepper", "cooking oil", "oil", "vegetable oil", "water"}
+PANTRY_STAPLES = {"salt", "pepper", "black pepper", "cooking oil", "oil", "vegetable oil", "olive oil",
+                  "canola oil", "cooking spray", "water"}
+MIN_PORTION_FACTOR, MAX_PORTION_FACTOR = 0.6, 1.8  # limits on how much the code may scale portions
+
+# Words that signal each allergen, so "milk" also catches cheese, butter, and yogurt.
+# This is a safety net on product names, not a substitute for reading labels.
+ALLERGEN_WORDS = {
+    "peanut": ["peanut", "peanuts"],
+    "tree nut": ["almond", "walnut", "pecan", "cashew", "pistachio", "hazelnut", "macadamia", "brazil nut",
+                 "pine nut", "nutella", "praline"],
+    "milk": ["milk", "cheese", "cheddar", "mozzarella", "parmesan", "butter", "yogurt", "cream", "whey",
+             "casein", "ghee", "queso", "dairy"],
+    "egg": ["egg", "eggs", "mayo", "mayonnaise", "meringue"],
+    "wheat": ["wheat", "bread", "pasta", "spaghetti", "penne", "macaroni", "noodle", "noodles", "flour",
+              "tortilla", "tortillas", "bagel", "bagels", "cracker", "crackers", "couscous", "bun", "buns",
+              "cereal", "pretzel", "pretzels", "seitan"],
+    "soy": ["soy", "soya", "tofu", "edamame", "tempeh", "miso"],
+    "fish": ["fish", "tuna", "salmon", "tilapia", "cod", "sardine", "sardines", "anchovy", "anchovies",
+             "pollock", "trout", "catfish"],
+    "shellfish": ["shellfish", "shrimp", "crab", "lobster", "clam", "clams", "oyster", "oysters",
+                  "scallop", "scallops", "mussel", "mussels", "crawfish", "prawn", "prawns"],
+    "sesame": ["sesame", "tahini"],
+}
+# Phrases that contain an allergen word but not the allergen (e.g. peanut butter has no milk)
+ALLERGEN_EXCEPTIONS = {
+    "milk": ["peanut butter", "almond butter", "sunflower butter", "apple butter", "cocoa butter",
+             "coconut milk", "almond milk", "oat milk", "soy milk", "rice milk", "cream of wheat"],
+    "egg": ["eggplant"],
+    "wheat": ["corn tortilla", "rice noodle", "rice flour", "corn flour", "almond flour"],
+}
+
+
+def contains_allergen(text, allergy):
+    """True if a product name suggests it contains the allergen."""
+    text = text.lower()
+    allergy = allergy.lower()
+    if allergy == "wheat" and ("gluten free" in text or "gluten-free" in text):
+        return False
+    for phrase in ALLERGEN_EXCEPTIONS.get(allergy, []):
+        text = text.replace(phrase, " ")
+    words = ALLERGEN_WORDS.get(allergy, [allergy])
+    return any(re.search(rf"\b{re.escape(word)}\b", text) for word in words)
 
 # One meal: its name plus the grocery items it uses
 MEAL = {
@@ -131,18 +174,25 @@ def ask_for_plan(client, profile, feedback=None):
         + f"- Calorie target: about {target} calories a day\n"
         + (f"- Protein target: at least {protein_goal} g a day\n" if protein_goal else "")
         + "Plan 7 days of breakfast, lunch, and dinner, then the grocery list.\n\n"
+        "Priorities, in this order: (1) stay within the budget, (2) hit the calorie target, "
+        "(3) meet the protein goal, (4) variety.\n\n"
         "Requirements:\n"
         f"- Keep the grocery list to {MAX_ITEMS} items or fewer, and do not list the same food twice.\n"
         "- For every meal, list its ingredients using the exact item names from your grocery list. "
-        "Every ingredient must be on the list, including condiments (like mayonnaise) and sides. "
-        "Only salt, pepper, cooking oil, and water can be left off.\n"
-        f"- The plan must provide between {low} and {high} calories a day.\n"
-        f"- Give the week variety: do not serve the same meal more than {MAX_REPEATS} times (leftovers count "
-        "as a repeat). Create variety by using the same ingredients in different ways, for example chicken "
-        "in tacos one day and a stir-fry another. Only repeat more if the budget truly requires it.\n"
-        "- Prices are looked up after you plan, so aim to spend about 80-90% of the budget.\n"
-        "- For protein on a budget, favor eggs, chicken thighs, canned beans, lentils, canned tuna, "
-        "peanut butter, and milk. Use at most two kinds of meat."
+        "Every ingredient must be on the list, including condiments (like mayonnaise) and sides.\n"
+        "- Salt, pepper, cooking oil, and water are already in the student's kitchen. Do not put them on the "
+        "grocery list.\n"
+        f"- The plan must provide between {low} and {high} calories a day. Set grams_per_week to the amount "
+        "the student will actually eat, so the calories add up to this target.\n"
+        "- Real prices often come in higher than expected, so aim to spend about 75-85% of the budget.\n"
+        "- Get calories cheaply from rice, oats, pasta, potatoes, dry beans, lentils, bananas, peanut butter, "
+        "eggs, and milk. Avoid pricey extras like olive oil, honey, specialty sauces, and nuts unless the "
+        "budget is generous.\n"
+        "- For protein on a budget, favor eggs, chicken thighs, canned or dry beans, lentils, canned tuna, "
+        "peanut butter, and milk. Use at most two kinds of meat.\n"
+        f"- Variety: avoid serving the same meal more than {MAX_REPEATS} times a week (leftovers count). Reuse "
+        "the same ingredients in different dishes, like chicken in tacos one day and a stir-fry another. "
+        "If the budget is tight, repeating meals is fine."
     )
     if feedback:
         request += f"\n\n{feedback}"
@@ -174,6 +224,8 @@ def clean_plan(plan):
         if not isinstance(item, dict) or not str(item.get("item", "")).strip():
             continue  # an item with no name can't be priced or checked, so skip it
         name = str(item["item"]).strip()
+        if name.lower() in PANTRY_STAPLES:
+            continue  # already in the kitchen, so don't buy it
         grocery.append({
             "item": name,
             "kroger_search": str(item.get("kroger_search") or name),
@@ -377,7 +429,7 @@ def run_checks(profile, plan, rows, unpriced, daily_calories, daily_protein, tot
 
     for allergy in profile["allergies"]:
         for row in rows:
-            if allergy.lower() in f"{row['item']} {row['product']}".lower():
+            if contains_allergen(f"{row['item']} {row['product']}", allergy):
                 problems.append(f"'{row['item']}' may contain {allergy}, which the student is allergic to.")
                 safe = False
     target, low, high = calorie_range(profile)
@@ -436,15 +488,26 @@ def run_checks(profile, plan, rows, unpriced, daily_calories, daily_protein, tot
 
 def feedback_for_revision(profile, rows, total_cost, daily_calories, daily_protein, problems, soft=()):
     """Tell Claude what its last plan really cost, item by item, so it can revise sensibly."""
-    lines = ["Your previous plan did not pass our checks. Here it is with the real Kroger prices we found:"]
+    lines = ["Your previous plan did not pass our checks. Here it is with real Kroger prices and USDA nutrition:"]
     for row in rows:
         price = f"${row['line_total']:.2f}" if row["line_total"] is not None else "price unavailable"
-        lines.append(f"- {row['item']}: {row['packages']} x {row['product']} = {price}")
+        if row["calories_week"] is not None:
+            food = f"{row['calories_week'] / 7:.0f} cal and {row['protein_week'] / 7:.0f} g protein a day"
+        else:
+            food = "nutrition unknown"
+        lines.append(f"- {row['item']}: {row['packages']} x {row['product']} = {price} | {food}")
+    target, low, high = calorie_range(profile)
     lines.append(
         f"Total: ${total_cost:.2f} (budget ${profile['budget']}). "
-        f"About {daily_calories:.0f} calories and {daily_protein:.0f} g protein a day."
+        f"About {daily_calories:.0f} calories a day (target {target}) and {daily_protein:.0f} g protein a day."
     )
-    target, low, high = calorie_range(profile)
+    if total_cost > profile["budget"]:
+        lines.append(f"You need to cut about ${total_cost - profile['budget']:.2f}.")
+    valued = [r for r in rows if r["line_total"] and r["calories_week"]]
+    if len(valued) >= 4:
+        valued.sort(key=lambda r: r["calories_week"] / r["line_total"], reverse=True)
+        lines.append("Best calories per dollar in this plan: " + ", ".join(r["item"] for r in valued[:3]) + ".")
+        lines.append("Worst calories per dollar in this plan: " + ", ".join(r["item"] for r in valued[-3:]) + ".")
     if problems:
         lines.append("Problems (must fix):")
         lines += [f"- {p}" for p in problems]
@@ -464,6 +527,57 @@ def feedback_for_revision(profile, rows, total_cost, daily_calories, daily_prote
             "repeats that are needed."
         )
     return "\n".join(lines)
+
+
+# ---------- Portions ----------
+
+def assemble_rows(items, choices, nutrition):
+    """Combine chosen products and nutrition into grocery rows, and note anything missing."""
+    rows, unpriced, no_nutrition, no_amount, usda_errors = [], [], [], [], []
+    for i, item in enumerate(items):
+        product, packages = choices.get(i, (None, 0))
+        facts = nutrition[i]
+        if product is None:
+            unpriced.append(item["item"])
+        if "problem" in facts:
+            no_nutrition.append(item["item"])
+            if facts["problem"] == "amount":
+                no_amount.append(item["item"])
+            elif facts["problem"] == "service":
+                usda_errors.append(facts["detail"])
+            facts = None
+        rows.append({
+            "item": item["item"],
+            "product": product["description"] + " " + product["size"] if product else "price unavailable",
+            "packages": packages,
+            "unit_price": product["price"] if product else None,
+            "line_total": product["price"] * packages if product else None,
+            "on_sale": product["on_sale"] if product else False,
+            "aisle": product["aisle"] if product else "",
+            "calories_week": facts["calories"] if facts else None,
+            "protein_week": facts["protein_g"] if facts else None,
+        })
+    total_cost = sum(r["line_total"] or 0 for r in rows)
+    daily_calories = sum(r["calories_week"] or 0 for r in rows) / 7
+    daily_protein = sum(r["protein_week"] or 0 for r in rows) / 7
+    return rows, unpriced, no_nutrition, no_amount, usda_errors, total_cost, daily_calories, daily_protein
+
+
+def scale_portions(items, nutrition, factor):
+    """Scale every portion by the same factor. Calories and protein scale in a straight line,
+    so this is plain arithmetic on the real USDA numbers, not a guess."""
+    new_items, new_nutrition = [], []
+    for item, facts in zip(items, nutrition):
+        item = dict(item)
+        if item.get("grams_per_week"):
+            item["grams_per_week"] = item["grams_per_week"] * factor
+            item["quantity_to_buy"] = f"enough for about {item['grams_per_week']:.0f} g this week"
+        new_items.append(item)
+        if "problem" in facts:
+            new_nutrition.append(facts)
+        else:
+            new_nutrition.append(dict(facts, calories=facts["calories"] * factor, protein_g=facts["protein_g"] * factor))
+    return new_items, new_nutrition
 
 
 # ---------- Putting it together ----------
@@ -498,34 +612,28 @@ def build_plan(profile, progress=print):
         tokens_in += usage.input_tokens
         tokens_out += usage.output_tokens
 
-        rows, unpriced, no_nutrition, no_amount, usda_errors = [], [], [], [], []
-        for i, item in enumerate(items):
-            product, packages = choices.get(i, (None, 0))
-            facts = nutrition[i]
-            if product is None:
-                unpriced.append(item["item"])
-            if "problem" in facts:
-                no_nutrition.append(item["item"])
-                if facts["problem"] == "amount":
-                    no_amount.append(item["item"])
-                elif facts["problem"] == "service":
-                    usda_errors.append(facts["detail"])
-                facts = None
-            rows.append({
-                "item": item["item"],
-                "product": product["description"] + " " + product["size"] if product else "price unavailable",
-                "packages": packages,
-                "unit_price": product["price"] if product else None,
-                "line_total": product["price"] * packages if product else None,
-                "on_sale": product["on_sale"] if product else False,
-                "aisle": product["aisle"] if product else "",
-                "calories_week": facts["calories"] if facts else None,
-                "protein_week": facts["protein_g"] if facts else None,
-            })
+        (rows, unpriced, no_nutrition, no_amount, usda_errors,
+         total_cost, daily_calories, daily_protein) = assemble_rows(items, choices, nutrition)
 
-        total_cost = sum(r["line_total"] or 0 for r in rows)
-        daily_calories = sum(r["calories_week"] or 0 for r in rows) / 7
-        daily_protein = sum(r["protein_week"] or 0 for r in rows) / 7
+        # If calories miss the target, scale portions to hit it, then re-pick package counts
+        target, low, high = calorie_range(profile)
+        portion_note = None
+        enough_data = items and len(no_nutrition) <= len(items) / 2
+        if enough_data and daily_calories > 0 and not low <= daily_calories <= high:
+            factor = min(max(target / daily_calories, MIN_PORTION_FACTOR), MAX_PORTION_FACTOR)
+            progress("Adjusting portions to hit your calorie target...")
+            items, nutrition = scale_portions(items, nutrition, factor)
+            plan["grocery_list"] = items
+            choices, usage = choose_products(client, items, options_by_item)
+            tokens_in += usage.input_tokens
+            tokens_out += usage.output_tokens
+            before = daily_calories
+            (rows, unpriced, no_nutrition, no_amount, usda_errors,
+             total_cost, daily_calories, daily_protein) = assemble_rows(items, choices, nutrition)
+            portion_note = (
+                f"Portions {'increased' if factor > 1 else 'reduced'} by {abs(factor - 1) * 100:.0f}% "
+                f"({before:.0f} to {daily_calories:.0f} calories a day)."
+            )
 
         # Problems with the data itself (not the food choices)
         data_problems = []
@@ -573,6 +681,8 @@ def build_plan(profile, progress=print):
         if best is None or score < best[0]:
             best = (score, result)
 
+        if portion_note:
+            log.append(f"Attempt {attempt}: {portion_note}")
         if service_error:
             log.append(f"Attempt {attempt}: stopped. {service_error}")
             break  # revising the plan can't fix an outage, so don't spend more attempts
@@ -603,8 +713,14 @@ def build_plan(profile, progress=print):
     result = best[1]
     result.update({"attempts": attempt, "tokens_in": tokens_in, "tokens_out": tokens_out, "log": log,
                    "service_error": service_error})
+    result["budget_note"] = None
     if not result["passed"]:
         log.append(f"No attempt passed every check. Showing attempt {result['attempt_shown']}, the closest one.")
+        if result["total_cost"] > profile["budget"]:
+            result["budget_note"] = (
+                f"We couldn't fit these goals into ${profile['budget']} a week at your Kroger. The closest plan costs "
+                f"${result['total_cost']:.2f}. A higher budget, or a lower calorie or protein target, would help."
+            )
     elif result["attempt_shown"] != attempt:
         log.append(
             f"The extra variety did not fit every requirement, so we kept attempt {result['attempt_shown']}."
