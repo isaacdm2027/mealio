@@ -18,7 +18,7 @@ try:
 except Exception:
     pass  # no Secrets box (running on a laptop), so the .env file is used instead
 
-from engine import build_plan, CALORIE_FLOOR
+from engine import build_plan, calorie_range, CALORIE_FLOOR
 
 STORES = {
     "Kroger - Alps Village (191 Alps Rd)": "01100428",
@@ -36,6 +36,7 @@ def save_run(profile, result):
     goal_met = (
         result["daily_protein"] >= profile["min_protein_g"] if profile.get("min_protein_g") else None
     )
+    target, low, high = calorie_range(profile)
     row = {
         "time": datetime.now().isoformat(timespec="seconds"),
         "budget": profile["budget"],
@@ -43,9 +44,12 @@ def save_run(profile, result):
         "under_budget": result["total_cost"] <= profile["budget"],
         "goal": profile["goal"],
         "protein_goal_met": goal_met,
+        "calorie_target": target,
+        "calorie_goal_met": (low <= result["daily_calories"] <= high) if result.get("nutrition_ok", True) else None,
         "daily_calories": round(result["daily_calories"]),
         "daily_protein": round(result["daily_protein"]),
         "passed_all_checks": result["passed"],
+        "different_meals": result["distinct_meals"],
         "attempts": result["attempts"],
         "tokens_in": result["tokens_in"],
         "tokens_out": result["tokens_out"],
@@ -80,18 +84,19 @@ with st.sidebar:
     allergies = st.multiselect("Allergies", ALLERGIES)
     diet = st.text_input("Dietary needs (optional)", placeholder="e.g. vegetarian, halal, no pork")
     goal = st.selectbox("Health goal", GOALS)
+    calories = st.number_input(
+        "Daily calorie target", min_value=CALORIE_FLOOR, max_value=4000, value=2000, step=100,
+        help=f"For safety, Meal.io won't plan below {CALORIE_FLOOR:,} calories a day.",
+    )
     protein = None
     if goal == "More protein":
         protein = st.number_input("Daily protein target (g)", 50, 200, 100, step=10)
     build = st.button("Build my plan", type="primary", width="stretch")
+
     st.caption(
         "Meal.io gives grocery suggestions, not medical advice. For personal nutrition help, "
         "the UGA Health Center offers free nutrition support."
     )
-    # TEMPORARY key check: shows whether each key loaded and its length, never the key itself
-    for key in KEY_NAMES:
-        value = os.getenv(key)
-        st.caption(f"{key}: {f'loaded, {len(value)} characters' if value else 'MISSING'}")
 
 profile = {
     "budget": budget,
@@ -99,6 +104,7 @@ profile = {
     "diet": diet or "no restrictions",
     "goal": goal,
     "min_protein_g": protein,
+    "calorie_target": calories,
     "location_id": STORES[store],
 }
 
@@ -112,7 +118,9 @@ if not result:
 
 # ---------- Results ----------
 
-if result["passed"]:
+if result.get("service_error"):
+    st.error(result["service_error"])
+elif result["passed"]:
     st.success("This plan passed every check: within budget, meets your goals, and everything is priced.")
 else:
     st.warning("We couldn't find a plan that passes every check. Here is the closest one:")
@@ -122,12 +130,19 @@ else:
 col1, col2, col3 = st.columns(3)
 col1.metric("Total cost", f"${result['total_cost']:.2f}", f"${result['budget'] - result['total_cost']:.2f} under budget"
             if result["total_cost"] <= result["budget"] else f"-${result['total_cost'] - result['budget']:.2f} over budget")
-col2.metric("Calories per day", f"{result['daily_calories']:.0f}", f"minimum {CALORIE_FLOOR}", delta_color="off")
-col3.metric("Protein per day", f"{result['daily_protein']:.0f} g",
+target, low, high = calorie_range(st.session_state.profile)
+nutrition_ok = result.get("nutrition_ok", True)
+col2.metric("Calories per day", f"{result['daily_calories']:.0f}" if nutrition_ok else "n/a", f"target {target:,} (range {low:,}-{high:,})",
+            delta_color="off")
+col3.metric("Protein per day", f"{result['daily_protein']:.0f} g" if nutrition_ok else "n/a",
             f"goal {st.session_state.profile['min_protein_g']} g" if st.session_state.profile.get("min_protein_g") else None,
             delta_color="off")
 
 st.subheader("Your week")
+st.caption(f"{result['distinct_meals']} different meals out of {result['total_meals']} this week.")
+if result["passed"] and result["variety_notes"]:
+    note = result["variety_notes"][0]
+    st.info("To stay within your budget and goals, " + note[0].lower() + note[1:])
 st.dataframe(
     [{"Day": d["day"], "Breakfast": d["breakfast"]["name"], "Lunch": d["lunch"]["name"], "Dinner": d["dinner"]["name"]}
      for d in result["plan"]["days"]],
